@@ -5,6 +5,7 @@ import os
 from quack.rmsnorm import rmsnorm
 from quack.softmax import softmax
 from quack.cross_entropy import cross_entropy
+from quack.groupnorm import groupnorm
 from quack.rounding import RoundingMode
 
 
@@ -19,5 +20,6 @@ __all__ = [
     "rmsnorm",
     "softmax",
     "cross_entropy",
+    "groupnorm",
     "RoundingMode",
 ]
