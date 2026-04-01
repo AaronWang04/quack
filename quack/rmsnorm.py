@@ -864,7 +864,7 @@ class RMSNormBackward(ReductionBase):
             cute.arch.fence_acq_rel_gpu()
             is_last_cta = Int32(0)
             if tidx == 0:
-                old = utils.atomic_add_acq_rel_gpu_i32(Int32(1), mSemaphore.iterator)
+                old = cute.arch.atomic_add(mSemaphore.iterator, Int32(1), sem="acq_rel", scope="gpu")
                 if old == gdim - 1:
                     is_last_cta = Int32(1)
             # Broadcast is_last_cta from thread 0 to all threads via smem

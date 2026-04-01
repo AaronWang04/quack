@@ -291,30 +291,6 @@ def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None)
         )
 
 
-@dsl_user_op
-def atomic_add_acq_rel_gpu_i32(
-    a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None
-) -> Int32:
-    from cutlass import CUDA_VERSION
-
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
-        return nvvm.atomicrmw(
-            res=T.i32(),
-            op=nvvm.AtomicOpKind.ADD,
-            ptr=gmem_ptr.llvm_ptr,
-            a=Int32(a).ir_value(),
-            memOrder=nvvm.MemOrderKind.ACQ_REL,
-            syncscope=nvvm.MemScopeKind.GPU,
-        )
-    else:
-        return nvvm.atomicrmw(
-            op=nvvm.AtomicOpKind.ADD,
-            ptr=gmem_ptr.llvm_ptr,
-            a=Int32(a).ir_value(),
-            mem_order=nvvm.MemOrderKind.ACQ_REL,
-            syncscope=nvvm.MemScopeKind.GPU,
-        )
-
 
 @dsl_user_op
 def issue_clc_query_nomulticast(
