@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
+import functools
 import math
 from typing import Optional, Tuple, Type
 from functools import partial
@@ -537,8 +538,10 @@ class RMSNormBackward(ReductionBase):
         mRstd: cute.Tensor,
         mdX: cute.Tensor,
         mdW: Optional[cute.Tensor],
+        mdW_final: Optional[cute.Tensor],
         mdRes: Optional[cute.Tensor],
         mdB: Optional[cute.Tensor],
+        mSemaphore: Optional[cute.Tensor],
         sm_count: Int32,
         stream: cuda.CUstream,
     ):
@@ -553,9 +556,24 @@ class RMSNormBackward(ReductionBase):
         mW = (
             layout_utils.expand(mW, dim=0, size=tiler_mn[0]) if const_expr(mW is not None) else None
         )
+        if const_expr(mdW_final is not None):
+            mdW_final = layout_utils.expand(mdW_final, dim=0, size=1)
         num_blocks = sm_count
         self.kernel(
-            mX, mW, mdO, mdResO, mRstd, mdX, mdW, mdB, mdRes, tiler_mn, tiled_copy, threads_per_row
+            mX,
+            mW,
+            mdO,
+            mdResO,
+            mRstd,
+            mdX,
+            mdW,
+            mdW_final,
+            mdB,
+            mdRes,
+            mSemaphore,
+            tiler_mn,
+            tiled_copy,
+            threads_per_row,
         ).launch(
             grid=[num_blocks, self.cluster_n, 1],
             block=[num_threads, 1, 1],
@@ -573,8 +591,10 @@ class RMSNormBackward(ReductionBase):
         mRstd: cute.Tensor,
         mdX: cute.Tensor,
         mdW: Optional[cute.Tensor],
+        mdW_final: Optional[cute.Tensor],
         mdB: Optional[cute.Tensor],
         mdRes: Optional[cute.Tensor],
+        mSemaphore: Optional[cute.Tensor],
         tiler_mn: cute.Shape,
         tiled_copy: cute.TiledCopy,
         threads_per_row: cutlass.Constexpr[int],
@@ -837,6 +857,43 @@ class RMSNormBackward(ReductionBase):
             if const_expr(mdB is not None):
                 copy(tXrdB, tXgdB)
 
+        # Last-CTA reduction: reduce dw_partial across CTAs into mdW_final.
+        # Only supported for cluster_n == 1; for cluster_n > 1 the caller
+        # must reduce dw_partial on the host.
+        if const_expr(mdW_final is not None and self.cluster_n == 1):
+            cute.arch.fence_acq_rel_gpu()
+            is_last_cta = Int32(0)
+            if tidx == 0:
+                old = utils.atomic_add_acq_rel_gpu_i32(Int32(1), mSemaphore.iterator)
+                if old == gdim - 1:
+                    is_last_cta = Int32(1)
+            # Broadcast is_last_cta from thread 0 to all threads via smem
+            sFlag = cute.make_tensor(
+                cute.recast_ptr(sX.iterator, dtype=Int32),
+                cute.make_layout((1,)),
+            )
+            if tidx == 0:
+                sFlag[0] = is_last_cta
+            cute.arch.barrier()
+            if sFlag[0]:
+                cute.arch.fence_acq_rel_gpu()
+                gdW_all = cute.local_tile(mdW, (1, tiler_mn[1]), (None, cluster_y))
+                gdW_final = cute.local_tile(mdW_final, (1, tiler_mn[1]), (0, cluster_y))
+                tXgdW_all = thr_copy_X.partition_S(gdW_all)
+                tXgdW_final = thr_copy_X.partition_D(gdW_final)
+                tXrdW_accum = cute.make_fragment_like(tXgdW_final, Float32)
+                tXrdW_accum.fill(0.0)
+                tXrdW_row = cute.make_fragment_like(tXgdW_all[None, None, None, 0])
+                for i in cutlass.range(0, gdim):
+                    copy(tXgdW_all[None, None, None, i], tXrdW_row)
+                    tXrdW_accum.store(tXrdW_accum.load() + tXrdW_row.load())
+                tXrdW_final = cute.make_fragment_like(tXgdW_final)
+                tXrdW_final.store(tXrdW_accum.load().to(tXrdW_final.element_type))
+                copy(tXrdW_final, tXgdW_final)
+                # Reset semaphore for the next kernel invocation
+                if tidx == 0:
+                    mSemaphore[0] = Int32(0)
+
         if const_expr(self.cluster_n > 1):  # Prevent cluster from exiting early
             # Assume state contains that next useful buffer
             # So we only need to advance to num_stages - 1 times to last used buffer
@@ -863,12 +920,17 @@ def _get_sm_count(N: int, device: torch.device) -> int:
     return sm_count
 
 
+@functools.cache
+def _get_semaphore(device: torch.device) -> torch.Tensor:
+    return torch.zeros(1, device=device, dtype=torch.int32)
+
+
 @torch.library.custom_op(
     "quack::_rmsnorm_bwd",
-    mutates_args={"dx", "dw_partial", "db_partial", "dresidual"},
+    mutates_args={"dx", "dw_partial", "db_partial", "dresidual", "dw"},
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
-    schema="(Tensor x, Tensor? weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!)? dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual, int? sm_count) -> ()",
+    schema="(Tensor x, Tensor? weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!)? dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual, int? sm_count, Tensor(a10!)? dw, Tensor? semaphore) -> ()",
 )
 def _rmsnorm_bwd(
     x: Tensor,
@@ -881,6 +943,8 @@ def _rmsnorm_bwd(
     dresidual_out: Optional[Tensor] = None,
     dresidual: Optional[Tensor] = None,
     sm_count: Optional[int] = None,
+    dw: Optional[Tensor] = None,
+    semaphore: Optional[Tensor] = None,
 ) -> None:
     """RMSNorm backward pass.
     Args:
@@ -922,6 +986,7 @@ def _rmsnorm_bwd(
         torch2cute_dtype_map[t.dtype] if t is not None else None
         for t in [x, dout, dx, weight, dresidual, dresidual_out]
     ]
+    dw_dtype = torch2cute_dtype_map[dw.dtype] if dw is not None else None
     _compile_rmsnorm_bwd(
         N,
         dtype,
@@ -932,7 +997,21 @@ def _rmsnorm_bwd(
         dres_dtype,
         dres_out_dtype,
         dw_partial is not None,
-    )(x, weight, dout, dresidual_out, rstd, dx, dw_partial, dresidual, db_partial, sm_count)
+        dw_dtype,
+    )(
+        x,
+        weight,
+        dout,
+        dresidual_out,
+        rstd,
+        dx,
+        dw_partial,
+        dw,
+        dresidual,
+        db_partial,
+        semaphore,
+        sm_count,
+    )
 
 
 @_rmsnorm_bwd.register_fake
@@ -947,6 +1026,8 @@ def _rmsnorm_bwd_fake(
     dresidual_out: Optional[Tensor] = None,
     dresidual: Optional[Tensor] = None,
     sm_count: Optional[int] = None,
+    dw: Optional[Tensor] = None,
+    semaphore: Optional[Tensor] = None,
 ) -> None:
     # See softmax.py _softmax_fwd_fake for why register_fake is needed.
     from quack.cache_utils import COMPILE_ONLY
@@ -959,6 +1040,7 @@ def _rmsnorm_bwd_fake(
             torch2cute_dtype_map[t.dtype] if t is not None else None
             for t in [x, dout, dx, weight, dresidual, dresidual_out]
         ]
+        dw_dtype = torch2cute_dtype_map[dw.dtype] if dw is not None else None
         _compile_rmsnorm_bwd(
             N,
             dtype,
@@ -969,6 +1051,7 @@ def _rmsnorm_bwd_fake(
             dres_dtype,
             dres_out_dtype,
             dw_partial is not None,
+            dw_dtype,
         )
 
 
@@ -983,6 +1066,7 @@ def _compile_rmsnorm_bwd(
     dres_dtype,
     dres_out_dtype,
     has_dw_partial,
+    dw_dtype=None,
 ):
     batch_sym, batch_partial_sym = cute.sym_int(), cute.sym_int()
     all_dtypes = [dtype, dout_dtype, dx_dtype, dres_dtype, dres_out_dtype]
@@ -995,6 +1079,8 @@ def _compile_rmsnorm_bwd(
     rstd_cute = fake_tensor(Float32, (batch_sym,))
     dw_partial_cute = fake_tensor(Float32, (batch_partial_sym, N), div) if has_dw_partial else None
     db_partial_cute = fake_tensor(Float32, (batch_partial_sym, N), div) if has_db_partial else None
+    dw_cute = fake_tensor(dw_dtype, (N,), div) if dw_dtype is not None else None
+    semaphore_cute = fake_tensor(Int32, (1,)) if dw_dtype is not None else None
     return cute.compile(
         RMSNormBackward(dtype, N),
         x_cute,
@@ -1004,8 +1090,10 @@ def _compile_rmsnorm_bwd(
         rstd_cute,
         dx_cute,
         dw_partial_cute,
+        dw_cute,
         dres_cute,
         db_partial_cute,
+        semaphore_cute,
         0,  # sm_count, just for compilation
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -1029,19 +1117,38 @@ def rmsnorm_bwd(
     else:
         dresidual = None
     sm_count = _get_sm_count(N, device)
+    dw_partial: Optional[Tensor] = None
+    dw: Optional[Tensor] = None
+    semaphore: Optional[Tensor] = None
+    # In-kernel cross-CTA dw reduction is only supported for cluster_n == 1
+    # (N <= 8192). For larger N the kernel ignores dw/semaphore and we fall
+    # back to a host-side reduction of dw_partial.
+    use_in_kernel_dw_reduction = N <= 8192
     if weight is not None:
         # Always store partial gradients in fp32 for numerical accuracy
         dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
-    else:
-        dw_partial = None
+        if use_in_kernel_dw_reduction:
+            dw = torch.empty(N, device=device, dtype=weight.dtype)
+            semaphore = _get_semaphore(device)
     db_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32) if has_bias else None
 
     _rmsnorm_bwd(
-        x, weight, dout, rstd, dx, dw_partial, db_partial, dresidual_out, dresidual, sm_count
+        x,
+        weight,
+        dout,
+        rstd,
+        dx,
+        dw_partial,
+        db_partial,
+        dresidual_out,
+        dresidual,
+        sm_count,
+        dw,
+        semaphore,
     )
 
-    # we have summed the partial gradients in fp32, now we convert back to the weight dtype
-    dw = dw_partial.sum(dim=0).to(weight.dtype) if weight is not None else None
+    if weight is not None and not use_in_kernel_dw_reduction:
+        dw = dw_partial.sum(dim=0).to(weight.dtype)
     db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
     # dresidual is the same as dx in this case
     if has_residual and dresidual is None:
