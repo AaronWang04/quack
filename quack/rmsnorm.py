@@ -883,10 +883,16 @@ class RMSNormBackward(ReductionBase):
                 tXgdW_final = thr_copy_X.partition_D(gdW_final)
                 tXrdW_accum = cute.make_fragment_like(tXgdW_final, Float32)
                 tXrdW_accum.fill(0.0)
+                tXrdW_comp = cute.make_fragment_like(tXgdW_final, Float32)
+                tXrdW_comp.fill(0.0)
                 tXrdW_row = cute.make_fragment_like(tXgdW_all[None, None, None, 0])
                 for i in cutlass.range(0, gdim):
                     copy(tXgdW_all[None, None, None, i], tXrdW_row)
-                    tXrdW_accum.store(tXrdW_accum.load() + tXrdW_row.load())
+                    # Kahan compensated summation to reduce fp32 rounding drift
+                    y = tXrdW_row.load() - tXrdW_comp.load()
+                    t = tXrdW_accum.load() + y
+                    tXrdW_comp.store(t - tXrdW_accum.load() - y)
+                    tXrdW_accum.store(t)
                 tXrdW_final = cute.make_fragment_like(tXgdW_final)
                 tXrdW_final.store(tXrdW_accum.load().to(tXrdW_final.element_type))
                 copy(tXrdW_final, tXgdW_final)
