@@ -291,7 +291,6 @@ def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None)
         )
 
 
-
 @dsl_user_op
 def issue_clc_query_nomulticast(
     mbar_ptr: cute.Pointer,

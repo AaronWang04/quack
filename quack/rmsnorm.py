@@ -1,6 +1,5 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
-import functools
 import math
 from typing import Optional, Tuple, Type
 from functools import partial
@@ -920,11 +919,6 @@ def _get_sm_count(N: int, device: torch.device) -> int:
     return sm_count
 
 
-@functools.cache
-def _get_semaphore(device: torch.device) -> torch.Tensor:
-    return torch.zeros(1, device=device, dtype=torch.int32)
-
-
 @torch.library.custom_op(
     "quack::_rmsnorm_bwd",
     mutates_args={"dx", "dw_partial", "db_partial", "dresidual", "dw"},
@@ -1129,7 +1123,7 @@ def rmsnorm_bwd(
         dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
         if use_in_kernel_dw_reduction:
             dw = torch.empty(N, device=device, dtype=weight.dtype)
-            semaphore = _get_semaphore(device)
+            semaphore = torch.zeros(1, device=device, dtype=torch.int32)
     db_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32) if has_bias else None
 
     _rmsnorm_bwd(
