@@ -864,7 +864,7 @@ class RMSNormBackward(ReductionBase):
             cute.arch.fence_acq_rel_gpu()
             is_last_cta = Int32(0)
             if tidx == 0:
-                old = cute.arch.atomic_add(mSemaphore.iterator, Int32(1), sem="acq_rel", scope="gpu")
+                old = utils.atomic_add_i32(Int32(1), mSemaphore.iterator)
                 if old == gdim - 1:
                     is_last_cta = Int32(1)
             # Broadcast is_last_cta from thread 0 to all threads via smem
@@ -883,16 +883,10 @@ class RMSNormBackward(ReductionBase):
                 tXgdW_final = thr_copy_X.partition_D(gdW_final)
                 tXrdW_accum = cute.make_fragment_like(tXgdW_final, Float32)
                 tXrdW_accum.fill(0.0)
-                tXrdW_comp = cute.make_fragment_like(tXgdW_final, Float32)
-                tXrdW_comp.fill(0.0)
                 tXrdW_row = cute.make_fragment_like(tXgdW_all[None, None, None, 0])
                 for i in cutlass.range(0, gdim):
                     copy(tXgdW_all[None, None, None, i], tXrdW_row)
-                    # Kahan compensated summation to reduce fp32 rounding drift
-                    y = tXrdW_row.load() - tXrdW_comp.load()
-                    t = tXrdW_accum.load() + y
-                    tXrdW_comp.store(t - tXrdW_accum.load() - y)
-                    tXrdW_accum.store(t)
+                    tXrdW_accum.store(tXrdW_accum.load() + tXrdW_row.load())
                 tXrdW_final = cute.make_fragment_like(tXgdW_final)
                 tXrdW_final.store(tXrdW_accum.load().to(tXrdW_final.element_type))
                 copy(tXrdW_final, tXgdW_final)
