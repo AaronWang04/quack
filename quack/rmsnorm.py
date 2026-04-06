@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
+import functools
 import math
 from typing import Optional, Tuple, Type
 from functools import partial
@@ -889,7 +890,7 @@ class RMSNormBackward(ReductionBase):
                 tXrdW_final = cute.make_fragment_like(tXgdW_final)
                 tXrdW_final.store(tXrdW_accum.load().to(tXrdW_final.element_type))
                 copy(tXrdW_final, tXgdW_final)
-                # Reset semaphore for the next kernel invocation
+                # Reset semaphore for the next kernel call (sem is cached)
                 if tidx == 0:
                     mSemaphore[0] = Int32(0)
 
@@ -904,6 +905,7 @@ class RMSNormBackward(ReductionBase):
 
 def _get_sm_count(N: int, device: torch.device) -> int:
     # This should be tuned on how many CTAs can be launched on each SM
+    # Current heuristic is too aggressive for backward with the CTA-reduction
     sm_count_multiple = (
         16 if N <= 256 else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
     )
@@ -917,6 +919,11 @@ def _get_sm_count(N: int, device: torch.device) -> int:
     )
 
     return sm_count
+
+
+@functools.cache
+def _get_semaphore(device: torch.device) -> torch.Tensor:
+    return torch.zeros(1, device=device, dtype=torch.int32)
 
 
 @torch.library.custom_op(
@@ -1123,7 +1130,7 @@ def rmsnorm_bwd(
         dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
         if use_in_kernel_dw_reduction:
             dw = torch.empty(N, device=device, dtype=weight.dtype)
-            semaphore = torch.zeros(1, device=device, dtype=torch.int32)
+            semaphore = _get_semaphore(device)
     db_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32) if has_bias else None
 
     _rmsnorm_bwd(
