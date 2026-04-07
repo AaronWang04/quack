@@ -903,12 +903,20 @@ class RMSNormBackward(ReductionBase):
             cute.arch.mbarrier_wait(mbar_empty_ptr + stage, producer_phase)
 
 
-def _get_sm_count(N: int, device: torch.device) -> int:
-    # This should be tuned on how many CTAs can be launched on each SM
-    # Current heuristic is too aggressive for backward with the CTA-reduction
-    sm_count_multiple = (
-        16 if N <= 256 else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
-    )
+def _get_sm_count(N: int, device: torch.device, fused_reduction: bool = False) -> int:
+    # This should be tuned on how many CTAs can be launched on each SM.
+    # When fused_reduction is True (in-kernel cross-CTA dW sum), fewer CTAs are
+    # better because the last CTA must serially read all partial results — the
+    # reduction cost is O(sm_count * N). Tuned on GB200.
+    if fused_reduction:
+        sm_count_multiple = (
+            2 if N <= 512 else (4 if N <= 1024 else (3 if N <= 2048 else (2 if N <= 4096 else 1)))
+        )
+    else:
+        sm_count_multiple = (
+            16 if N <= 256
+            else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
+        )
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     # By right, if we're using cluster, this should be cluster_count not sm_count.
     # But for cluster >= 4, due to quantization we would need to query active max cluster.
@@ -1117,14 +1125,14 @@ def rmsnorm_bwd(
         dresidual = torch.empty_like(x, dtype=dresidual_out.dtype)
     else:
         dresidual = None
-    sm_count = _get_sm_count(N, device)
     dw_partial: Optional[Tensor] = None
     dw: Optional[Tensor] = None
     semaphore: Optional[Tensor] = None
     # In-kernel cross-CTA dw reduction is only supported for cluster_n == 1
     # (N <= 8192). For larger N the kernel ignores dw/semaphore and we fall
     # back to a host-side reduction of dw_partial.
-    use_in_kernel_dw_reduction = N <= 8192
+    use_in_kernel_dw_reduction = N <= 8192 and weight is not None
+    sm_count = _get_sm_count(N, device, fused_reduction=use_in_kernel_dw_reduction)
     if weight is not None:
         # Always store partial gradients in fp32 for numerical accuracy
         dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
