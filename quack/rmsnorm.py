@@ -920,7 +920,7 @@ def _get_sm_count(N: int, device: torch.device) -> int:
 
     return sm_count
 
-
+# Reuse same semaphore to avoid repeated torch.zero calls
 @functools.cache
 def _get_semaphore(device: torch.device) -> torch.Tensor:
     return torch.zeros(1, device=device, dtype=torch.int32)
