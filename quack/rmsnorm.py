@@ -914,8 +914,7 @@ def _get_sm_count(N: int, device: torch.device, fused_reduction: bool = False) -
         )
     else:
         sm_count_multiple = (
-            16 if N <= 256
-            else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
+            16 if N <= 256 else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
         )
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     # By right, if we're using cluster, this should be cluster_count not sm_count.
@@ -927,6 +926,7 @@ def _get_sm_count(N: int, device: torch.device, fused_reduction: bool = False) -
     )
 
     return sm_count
+
 
 # Reuse same semaphore to avoid repeated torch.zero calls
 @functools.cache
