@@ -537,6 +537,7 @@ class RMSNormBackward(ReductionBase):
         mRstd: cute.Tensor,
         mdX: cute.Tensor,
         mdW: Optional[cute.Tensor],
+        mdW_final: Optional[cute.Tensor],
         mdRes: Optional[cute.Tensor],
         mdB: Optional[cute.Tensor],
         sm_count: Int32,
@@ -555,7 +556,8 @@ class RMSNormBackward(ReductionBase):
         )
         num_blocks = sm_count
         self.kernel(
-            mX, mW, mdO, mdResO, mRstd, mdX, mdW, mdB, mdRes, tiler_mn, tiled_copy, threads_per_row
+            mX, mW, mdO, mdResO, mRstd, mdX, mdW, mdW_final, mdB, mdRes,
+            tiler_mn, tiled_copy, threads_per_row,
         ).launch(
             grid=[num_blocks, self.cluster_n, 1],
             block=[num_threads, 1, 1],
@@ -573,6 +575,7 @@ class RMSNormBackward(ReductionBase):
         mRstd: cute.Tensor,
         mdX: cute.Tensor,
         mdW: Optional[cute.Tensor],
+        mdW_final: Optional[cute.Tensor],
         mdB: Optional[cute.Tensor],
         mdRes: Optional[cute.Tensor],
         tiler_mn: cute.Shape,
@@ -788,6 +791,8 @@ class RMSNormBackward(ReductionBase):
                 producer_phase ^= 1
 
         if const_expr(tiler_mn[0] > 1):
+            # Drain outstanding cp_async groups before reusing sX as sdW
+            cute.arch.cp_async_wait_group(0)
             if const_expr(mdW is not None):
                 # reduction of dw_partial within the same threadblock
                 sdW = cute.make_tensor(
@@ -837,6 +842,36 @@ class RMSNormBackward(ReductionBase):
             if const_expr(mdB is not None):
                 copy(tXrdB, tXgdB)
 
+        # Cross-CTA dW reduction using cp.reduce.async.bulk.
+        # Each CTA loads its dw_partial row from gmem into smem (contiguous),
+        # then thread 0 atomically adds it to dw_final via bulk reduce.
+        # dw_final must be zero-initialized by the caller.
+        if const_expr(mdW_final is not None and self.cluster_n == 1):
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+            sdW_buf = cute.make_tensor(
+                cute.recast_ptr(sX.iterator, dtype=cute.Float32),
+                cute.make_layout((tiler_mn[1],)),
+            )
+            # Load dw_partial[bidx_start, :] from gmem into smem contiguously
+            gdW_1d = cute.make_tensor(
+                gdW.iterator, cute.make_layout((tiler_mn[1],))
+            )
+            num_thr = cute.size(tiled_copy)
+            for i in cutlass.range(tidx, tiler_mn[1], num_thr):
+                sdW_buf[i] = gdW_1d[i]
+            # fence.proxy.async makes normal smem stores visible to the async
+            # proxy (TMA engine) before the bulk reduce reads them.
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.barrier()
+            if tidx == 0:
+                store_bytes = const_expr(tiler_mn[1] * 4)
+                copy_utils.cpasync_reduce_bulk_add_f32(
+                    sdW_buf.iterator, mdW_final.iterator, store_bytes,
+                )
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0)
+
         if const_expr(self.cluster_n > 1):  # Prevent cluster from exiting early
             # Assume state contains that next useful buffer
             # So we only need to advance to num_stages - 1 times to last used buffer
@@ -865,10 +900,10 @@ def _get_sm_count(N: int, device: torch.device) -> int:
 
 @torch.library.custom_op(
     "quack::_rmsnorm_bwd",
-    mutates_args={"dx", "dw_partial", "db_partial", "dresidual"},
+    mutates_args={"dx", "dw_partial", "db_partial", "dresidual", "dw"},
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
-    schema="(Tensor x, Tensor? weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!)? dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual, int? sm_count) -> ()",
+    schema="(Tensor x, Tensor? weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!)? dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual, int? sm_count, Tensor(a10!)? dw) -> ()",
 )
 def _rmsnorm_bwd(
     x: Tensor,
@@ -881,6 +916,7 @@ def _rmsnorm_bwd(
     dresidual_out: Optional[Tensor] = None,
     dresidual: Optional[Tensor] = None,
     sm_count: Optional[int] = None,
+    dw: Optional[Tensor] = None,
 ) -> None:
     """RMSNorm backward pass.
     Args:
@@ -922,6 +958,7 @@ def _rmsnorm_bwd(
         torch2cute_dtype_map[t.dtype] if t is not None else None
         for t in [x, dout, dx, weight, dresidual, dresidual_out]
     ]
+    dw_dtype = torch2cute_dtype_map[dw.dtype] if dw is not None else None
     _compile_rmsnorm_bwd(
         N,
         dtype,
@@ -932,7 +969,8 @@ def _rmsnorm_bwd(
         dres_dtype,
         dres_out_dtype,
         dw_partial is not None,
-    )(x, weight, dout, dresidual_out, rstd, dx, dw_partial, dresidual, db_partial, sm_count)
+        dw_dtype,
+    )(x, weight, dout, dresidual_out, rstd, dx, dw_partial, dw, dresidual, db_partial, sm_count)
 
 
 @_rmsnorm_bwd.register_fake
@@ -947,6 +985,7 @@ def _rmsnorm_bwd_fake(
     dresidual_out: Optional[Tensor] = None,
     dresidual: Optional[Tensor] = None,
     sm_count: Optional[int] = None,
+    dw: Optional[Tensor] = None,
 ) -> None:
     # See softmax.py _softmax_fwd_fake for why register_fake is needed.
     from quack.cache_utils import COMPILE_ONLY
@@ -959,6 +998,7 @@ def _rmsnorm_bwd_fake(
             torch2cute_dtype_map[t.dtype] if t is not None else None
             for t in [x, dout, dx, weight, dresidual, dresidual_out]
         ]
+        dw_dtype = torch2cute_dtype_map[dw.dtype] if dw is not None else None
         _compile_rmsnorm_bwd(
             N,
             dtype,
@@ -969,6 +1009,7 @@ def _rmsnorm_bwd_fake(
             dres_dtype,
             dres_out_dtype,
             dw_partial is not None,
+            dw_dtype,
         )
 
 
@@ -983,6 +1024,7 @@ def _compile_rmsnorm_bwd(
     dres_dtype,
     dres_out_dtype,
     has_dw_partial,
+    dw_dtype=None,
 ):
     batch_sym, batch_partial_sym = cute.sym_int(), cute.sym_int()
     all_dtypes = [dtype, dout_dtype, dx_dtype, dres_dtype, dres_out_dtype]
@@ -995,6 +1037,7 @@ def _compile_rmsnorm_bwd(
     rstd_cute = fake_tensor(Float32, (batch_sym,))
     dw_partial_cute = fake_tensor(Float32, (batch_partial_sym, N), div) if has_dw_partial else None
     db_partial_cute = fake_tensor(Float32, (batch_partial_sym, N), div) if has_db_partial else None
+    dw_cute = fake_tensor(dw_dtype, (N,), div) if dw_dtype is not None else None
     return cute.compile(
         RMSNormBackward(dtype, N),
         x_cute,
@@ -1004,6 +1047,7 @@ def _compile_rmsnorm_bwd(
         rstd_cute,
         dx_cute,
         dw_partial_cute,
+        dw_cute,
         dres_cute,
         db_partial_cute,
         0,  # sm_count, just for compilation
@@ -1029,19 +1073,29 @@ def rmsnorm_bwd(
     else:
         dresidual = None
     sm_count = _get_sm_count(N, device)
+    dw_partial: Optional[Tensor] = None
+    dw: Optional[Tensor] = None
+    # In-kernel cross-CTA dw reduction using cp.reduce.async.bulk is only
+    # supported for cluster_n == 1 (N <= 8192). For larger N the kernel
+    # ignores dw and we fall back to a host-side reduction of dw_partial.
+    use_in_kernel_dw_reduction = N <= 8192 and weight is not None
     if weight is not None:
         # Always store partial gradients in fp32 for numerical accuracy
         dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
-    else:
-        dw_partial = None
+        if use_in_kernel_dw_reduction:
+            # Zero-init: each CTA atomically adds its partial via bulk reduce
+            dw = torch.zeros(N, device=device, dtype=torch.float32)
     db_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32) if has_bias else None
 
     _rmsnorm_bwd(
-        x, weight, dout, rstd, dx, dw_partial, db_partial, dresidual_out, dresidual, sm_count
+        x, weight, dout, rstd, dx, dw_partial, db_partial, dresidual_out, dresidual, sm_count, dw
     )
 
-    # we have summed the partial gradients in fp32, now we convert back to the weight dtype
-    dw = dw_partial.sum(dim=0).to(weight.dtype) if weight is not None else None
+    if weight is not None:
+        if use_in_kernel_dw_reduction:
+            dw = dw.to(weight.dtype)
+        else:
+            dw = dw_partial.sum(dim=0).to(weight.dtype)
     db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
     # dresidual is the same as dx in this case
     if has_residual and dresidual is None:
