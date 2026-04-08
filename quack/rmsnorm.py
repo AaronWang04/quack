@@ -854,16 +854,19 @@ class RMSNormBackward(ReductionBase):
                 cute.recast_ptr(sX.iterator, dtype=cute.Float32),
                 cute.make_layout((tiler_mn[1],)),
             )
-            # Load dw_partial[bidx_start, :] from gmem into smem contiguously
+            # Load dw_partial[bidx_start, :] from gmem into smem via cp.async
             gdW_1d = cute.make_tensor(
                 gdW.iterator, cute.make_layout((tiler_mn[1],))
             )
             num_thr = cute.size(tiled_copy)
-            for i in cutlass.range(tidx, tiler_mn[1], num_thr):
-                sdW_buf[i] = gdW_1d[i]
-            # fence.proxy.async makes normal smem stores visible to the async
-            # proxy (TMA engine) before the bulk reduce reads them.
-            cute.arch.fence_proxy("async.shared", space="cta")
+            vecsize_f32 = const_expr(min(tiler_mn[1], 128 // cute.Float32.width))
+            thr_copy_dw = copy_utils.tiled_copy_1d(
+                cute.Float32, num_thr, vecsize_f32, is_async=True
+            )
+            thr_dw = thr_copy_dw.get_slice(tidx)
+            copy_utils.copy(thr_dw.partition_S(gdW_1d), thr_dw.partition_D(sdW_buf), is_async=True)
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
             if tidx == 0:
                 store_bytes = const_expr(tiler_mn[1] * 4)
@@ -1080,7 +1083,7 @@ def rmsnorm_bwd(
     # In-kernel cross-CTA dw reduction using cp.reduce.async.bulk is only
     # supported for cluster_n == 1 (N <= 8192). For larger N the kernel
     # ignores dw and we fall back to a host-side reduction of dw_partial.
-    use_in_kernel_dw_reduction = N <= 8192 and weight is not None
+    use_in_kernel_dw_reduction = N <= 4096 and weight is not None
     if weight is not None:
         # Always store partial gradients in fp32 for numerical accuracy
         dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
