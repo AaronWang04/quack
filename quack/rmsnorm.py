@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
+import functools
 import math
 from typing import Optional, Tuple, Type
 from functools import partial
@@ -881,6 +882,7 @@ class RMSNormBackward(ReductionBase):
             cute.arch.mbarrier_wait(mbar_empty_ptr + stage, producer_phase)
 
 
+@functools.lru_cache(maxsize=None)
 def _get_sm_count(N: int, device: torch.device) -> int:
     # This should be tuned on how many CTAs can be launched on each SM
     sm_count_multiple = (
