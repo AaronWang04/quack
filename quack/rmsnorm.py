@@ -541,7 +541,9 @@ class RMSNormBackward(ReductionBase):
         mdW_final: Optional[cute.Tensor],
         mdRes: Optional[cute.Tensor],
         mdB: Optional[cute.Tensor],
+        mSemaphore: Optional[cute.Tensor],
         sm_count: Int32,
+        group_size: Int32,
         stream: cuda.CUstream,
     ):
         assert mX.element_type == self.dtype
@@ -555,10 +557,25 @@ class RMSNormBackward(ReductionBase):
         mW = (
             layout_utils.expand(mW, dim=0, size=tiler_mn[0]) if const_expr(mW is not None) else None
         )
+        if const_expr(mdW_final is not None):
+            mdW_final = layout_utils.expand(mdW_final, dim=0, size=1)
         num_blocks = sm_count
         self.kernel(
-            mX, mW, mdO, mdResO, mRstd, mdX, mdW, mdW_final, mdB, mdRes,
-            tiler_mn, tiled_copy, threads_per_row,
+            mX,
+            mW,
+            mdO,
+            mdResO,
+            mRstd,
+            mdX,
+            mdW,
+            mdW_final,
+            mdB,
+            mdRes,
+            mSemaphore,
+            group_size,
+            tiler_mn,
+            tiled_copy,
+            threads_per_row,
         ).launch(
             grid=[num_blocks, self.cluster_n, 1],
             block=[num_threads, 1, 1],
@@ -579,6 +596,8 @@ class RMSNormBackward(ReductionBase):
         mdW_final: Optional[cute.Tensor],
         mdB: Optional[cute.Tensor],
         mdRes: Optional[cute.Tensor],
+        mSemaphore: Optional[cute.Tensor],
+        group_size: Int32,
         tiler_mn: cute.Shape,
         tiled_copy: cute.TiledCopy,
         threads_per_row: cutlass.Constexpr[int],
@@ -792,8 +811,6 @@ class RMSNormBackward(ReductionBase):
                 producer_phase ^= 1
 
         if const_expr(tiler_mn[0] > 1):
-            # Drain outstanding cp_async groups before reusing sX as sdW
-            cute.arch.cp_async_wait_group(0)
             if const_expr(mdW is not None):
                 # reduction of dw_partial within the same threadblock
                 sdW = cute.make_tensor(
@@ -843,38 +860,94 @@ class RMSNormBackward(ReductionBase):
             if const_expr(mdB is not None):
                 copy(tXrdB, tXgdB)
 
-        # Cross-CTA dW reduction using cp.reduce.async.bulk.
-        # Each CTA loads its dw_partial row from gmem into smem (contiguous),
-        # then thread 0 atomically adds it to dw_final via bulk reduce.
-        # dw_final must be zero-initialized by the caller.
+        # Two-level grouped reduction: reduce dw_partial across CTAs into mdW_final.
+        # Level 1: each group of group_size CTAs reduces to dw_partial[group_leader].
+        # Level 2: the last group-reducer reduces G group sums into mdW_final.
+        # Only supported for cluster_n == 1; for cluster_n > 1 the caller
+        # must reduce dw_partial on the host.
         if const_expr(mdW_final is not None and self.cluster_n == 1):
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
-            sdW_buf = cute.make_tensor(
-                cute.recast_ptr(sX.iterator, dtype=cute.Float32),
-                cute.make_layout((tiler_mn[1],)),
+            cute.arch.fence_acq_rel_gpu()
+
+            # Group assignment (integer arithmetic)
+            my_group = Int32(bidx_start / group_size)
+            group_base = Int32(my_group * group_size)
+            group_count = Int32(group_size)
+            if group_base + group_size > gdim:
+                group_count = Int32(gdim - group_base)
+            num_groups = Int32((gdim + group_size - Int32(1)) / group_size)
+
+            # smem flag for broadcasting from thread 0 to all threads
+            sFlag = cute.make_tensor(
+                cute.recast_ptr(sX.iterator, dtype=Int32),
+                cute.make_layout((1,)),
             )
-            # Load dw_partial[bidx_start, :] from gmem into smem via cp.async
-            gdW_1d = cute.make_tensor(
-                gdW.iterator, cute.make_layout((tiler_mn[1],))
-            )
-            num_thr = cute.size(tiled_copy)
-            vecsize_f32 = const_expr(min(tiler_mn[1], 128 // cute.Float32.width))
-            thr_copy_dw = copy_utils.tiled_copy_1d(
-                cute.Float32, num_thr, vecsize_f32, is_async=True
-            )
-            thr_dw = thr_copy_dw.get_slice(tidx)
-            copy_utils.copy(thr_dw.partition_S(gdW_1d), thr_dw.partition_D(sdW_buf), is_async=True)
-            cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
+
+            # Tiled views for reading/writing dw_partial rows
+            gdW_all = cute.local_tile(mdW, (1, tiler_mn[1]), (None, cluster_y))
+            tXgdW_all = thr_copy_X.partition_S(gdW_all)
+
+            # --- Level 1: intra-group reduction ---
+            is_last_in_group = Int32(0)
             if tidx == 0:
-                store_bytes = const_expr(tiler_mn[1] * 4)
-                copy_utils.cpasync_reduce_bulk_add_f32(
-                    sdW_buf.iterator, mdW_final.iterator, store_bytes,
+                old = utils.atomic_add_i32(Int32(1), mSemaphore.iterator + my_group)
+                if old == group_count - Int32(1):
+                    is_last_in_group = Int32(1)
+            if tidx == 0:
+                sFlag[0] = is_last_in_group
+            cute.arch.barrier()
+
+            if sFlag[0]:
+                cute.arch.fence_acq_rel_gpu()
+                # Sum dw_partial[group_base..group_base+group_count) into accum
+                tXrdW_accum = cute.make_fragment_like(
+                    tXgdW_all[None, None, None, 0], Float32,
                 )
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0)
+                tXrdW_accum.fill(0.0)
+                tXrdW_row = cute.make_fragment_like(tXgdW_all[None, None, None, 0])
+                for i in cutlass.range(group_base, group_base + group_count):
+                    copy(tXgdW_all[None, None, None, i], tXrdW_row)
+                    tXrdW_accum.store(tXrdW_accum.load() + tXrdW_row.load())
+                # Write group sum to dw_partial[group_base, :]
+                gdW_leader = cute.local_tile(
+                    mdW, (1, tiler_mn[1]), (group_base, cluster_y),
+                )
+                tXgdW_leader = thr_copy_X.partition_D(gdW_leader)
+                tXrdW_write = cute.make_fragment_like(tXgdW_leader)
+                tXrdW_write.store(tXrdW_accum.load().to(tXrdW_write.element_type))
+                copy(tXrdW_write, tXgdW_leader)
+
+                # --- Level 2: cross-group reduction ---
+                cute.arch.fence_acq_rel_gpu()
+                is_last_group = Int32(0)
+                if tidx == 0:
+                    old = utils.atomic_add_i32(
+                        Int32(1), mSemaphore.iterator + num_groups,
+                    )
+                    if old == num_groups - Int32(1):
+                        is_last_group = Int32(1)
+                if tidx == 0:
+                    sFlag[0] = is_last_group
+                cute.arch.barrier()
+
+                if sFlag[0]:
+                    cute.arch.fence_acq_rel_gpu()
+                    # Sum group leaders: dw_partial[0], dw_partial[K], dw_partial[2K], ...
+                    gdW_final = cute.local_tile(
+                        mdW_final, (1, tiler_mn[1]), (0, cluster_y),
+                    )
+                    tXgdW_final = thr_copy_X.partition_D(gdW_final)
+                    tXrdW_accum2 = cute.make_fragment_like(tXgdW_final, Float32)
+                    tXrdW_accum2.fill(0.0)
+                    tXrdW_row2 = cute.make_fragment_like(tXgdW_all[None, None, None, 0])
+                    for g in cutlass.range(0, num_groups):
+                        leader_row = g * group_size
+                        copy(tXgdW_all[None, None, None, leader_row], tXrdW_row2)
+                        tXrdW_accum2.store(tXrdW_accum2.load() + tXrdW_row2.load())
+                    tXrdW_final = cute.make_fragment_like(tXgdW_final)
+                    tXrdW_final.store(
+                        tXrdW_accum2.load().to(tXrdW_final.element_type)
+                    )
+                    copy(tXrdW_final, tXgdW_final)
 
         if const_expr(self.cluster_n > 1):  # Prevent cluster from exiting early
             # Assume state contains that next useful buffer
@@ -885,12 +958,19 @@ class RMSNormBackward(ReductionBase):
             cute.arch.mbarrier_wait(mbar_empty_ptr + stage, producer_phase)
 
 
-@functools.lru_cache(maxsize=None)
-def _get_sm_count(N: int, device: torch.device) -> int:
-    # This should be tuned on how many CTAs can be launched on each SM
-    sm_count_multiple = (
-        16 if N <= 256 else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
-    )
+def _get_sm_count(N: int, device: torch.device, fused_reduction: bool = False) -> int:
+    # This should be tuned on how many CTAs can be launched on each SM.
+    # When fused_reduction is True (in-kernel two-level cross-CTA dW sum),
+    # the reduction cost is O(sqrt(sm_count) * N) — much cheaper than the old
+    # serial O(sm_count * N), so we can afford higher CTA counts.
+    if fused_reduction:
+        sm_count_multiple = (
+            8 if N <= 512 else (4 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
+        )
+    else:
+        sm_count_multiple = (
+            16 if N <= 256 else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
+        )
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     # By right, if we're using cluster, this should be cluster_count not sm_count.
     # But for cluster >= 4, due to quantization we would need to query active max cluster.
@@ -903,12 +983,19 @@ def _get_sm_count(N: int, device: torch.device) -> int:
     return sm_count
 
 
+# Reuse same semaphore to avoid repeated torch.zero calls.
+# 64 slots: up to G per-group counters + 1 global counter.
+@functools.cache
+def _get_semaphore(device: torch.device) -> torch.Tensor:
+    return torch.zeros(64, device=device, dtype=torch.int32)
+
+
 @torch.library.custom_op(
     "quack::_rmsnorm_bwd",
     mutates_args={"dx", "dw_partial", "db_partial", "dresidual", "dw"},
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
-    schema="(Tensor x, Tensor? weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!)? dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual, int? sm_count, Tensor(a10!)? dw) -> ()",
+    schema="(Tensor x, Tensor? weight, Tensor dout, Tensor rstd, Tensor(a4!) dx, Tensor(a5!)? dw_partial, Tensor(a6!)? db_partial, Tensor? dresidual_out, Tensor(a8!)? dresidual, int? sm_count, Tensor(a10!)? dw, Tensor? semaphore, int? group_size) -> ()",
 )
 def _rmsnorm_bwd(
     x: Tensor,
@@ -922,6 +1009,8 @@ def _rmsnorm_bwd(
     dresidual: Optional[Tensor] = None,
     sm_count: Optional[int] = None,
     dw: Optional[Tensor] = None,
+    semaphore: Optional[Tensor] = None,
+    group_size: Optional[int] = None,
 ) -> None:
     """RMSNorm backward pass.
     Args:
@@ -975,7 +1064,21 @@ def _rmsnorm_bwd(
         dres_out_dtype,
         dw_partial is not None,
         dw_dtype,
-    )(x, weight, dout, dresidual_out, rstd, dx, dw_partial, dw, dresidual, db_partial, sm_count)
+    )(
+        x,
+        weight,
+        dout,
+        dresidual_out,
+        rstd,
+        dx,
+        dw_partial,
+        dw,
+        dresidual,
+        db_partial,
+        semaphore,
+        sm_count,
+        group_size if group_size is not None else 0,
+    )
 
 
 @_rmsnorm_bwd.register_fake
@@ -991,6 +1094,8 @@ def _rmsnorm_bwd_fake(
     dresidual: Optional[Tensor] = None,
     sm_count: Optional[int] = None,
     dw: Optional[Tensor] = None,
+    semaphore: Optional[Tensor] = None,
+    group_size: Optional[int] = None,
 ) -> None:
     # See softmax.py _softmax_fwd_fake for why register_fake is needed.
     from quack.cache_utils import COMPILE_ONLY
@@ -1043,6 +1148,7 @@ def _compile_rmsnorm_bwd(
     dw_partial_cute = fake_tensor(Float32, (batch_partial_sym, N), div) if has_dw_partial else None
     db_partial_cute = fake_tensor(Float32, (batch_partial_sym, N), div) if has_db_partial else None
     dw_cute = fake_tensor(dw_dtype, (N,), div) if dw_dtype is not None else None
+    semaphore_cute = fake_tensor(Int32, (64,)) if dw_dtype is not None else None
     return cute.compile(
         RMSNormBackward(dtype, N),
         x_cute,
@@ -1055,7 +1161,9 @@ def _compile_rmsnorm_bwd(
         dw_cute,
         dres_cute,
         db_partial_cute,
+        semaphore_cute,
         0,  # sm_count, just for compilation
+        0,  # group_size, just for compilation
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1077,30 +1185,44 @@ def rmsnorm_bwd(
         dresidual = torch.empty_like(x, dtype=dresidual_out.dtype)
     else:
         dresidual = None
-    sm_count = _get_sm_count(N, device)
     dw_partial: Optional[Tensor] = None
     dw: Optional[Tensor] = None
-    # In-kernel cross-CTA dw reduction using cp.reduce.async.bulk is only
-    # supported for cluster_n == 1 (N <= 8192). For larger N the kernel
-    # ignores dw and we fall back to a host-side reduction of dw_partial.
-    use_in_kernel_dw_reduction = N <= 4096 and weight is not None
+    semaphore: Optional[Tensor] = None
+    group_size: Optional[int] = None
+    # In-kernel cross-CTA dw reduction is only supported for cluster_n == 1
+    # (N <= 8192). For larger N the kernel ignores dw/semaphore and we fall
+    # back to a host-side reduction of dw_partial.
+    use_in_kernel_dw_reduction = N <= 8192 and weight is not None
+    sm_count = _get_sm_count(N, device, fused_reduction=use_in_kernel_dw_reduction)
     if weight is not None:
         # Always store partial gradients in fp32 for numerical accuracy
         dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
         if use_in_kernel_dw_reduction:
-            # Zero-init: each CTA atomically adds its partial via bulk reduce
-            dw = torch.zeros(N, device=device, dtype=torch.float32)
+            dw = torch.empty(N, device=device, dtype=weight.dtype)
+            semaphore = _get_semaphore(device)
+            semaphore.zero_()
+            G = math.ceil(math.sqrt(sm_count))
+            group_size = math.ceil(sm_count / G)
     db_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32) if has_bias else None
 
     _rmsnorm_bwd(
-        x, weight, dout, rstd, dx, dw_partial, db_partial, dresidual_out, dresidual, sm_count, dw
+        x,
+        weight,
+        dout,
+        rstd,
+        dx,
+        dw_partial,
+        db_partial,
+        dresidual_out,
+        dresidual,
+        sm_count,
+        dw,
+        semaphore,
+        group_size,
     )
 
-    if weight is not None:
-        if use_in_kernel_dw_reduction:
-            dw = dw.to(weight.dtype)
-        else:
-            dw = dw_partial.sum(dim=0).to(weight.dtype)
+    if weight is not None and not use_in_kernel_dw_reduction:
+        dw = dw_partial.sum(dim=0).to(weight.dtype)
     db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
     # dresidual is the same as dx in this case
     if has_residual and dresidual is None:
